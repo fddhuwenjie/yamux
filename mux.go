@@ -33,6 +33,20 @@ type Config struct {
 	// window size that we allow for a stream.
 	MaxStreamWindowSize uint32
 
+	// MaxSessionReceiveWindowSize 用于限制整条会话中“已接收但尚未被任何流
+	// 读取”的数据总量（会话级流控）。单流接收窗口只能约束单个流，慢读者
+	// 较多时，各流的未读数据仍会在接收端不断累积；启用该配置后，接收端会
+	// 在会话建立时向对端通告一个全会话接收窗口，发送端所有流的数据帧总量
+	// 受该额度约束，额度耗尽时写入会阻塞，直到接收端读取任意流的数据或完全
+	// 关闭仍带未读数据的流从而返还额度。
+	//
+	// 取零值（默认）时保持原有行为：不发送会话窗口通告，也不进行会话级流控，
+	// 与旧版本对端完全兼容。仅一端启用时同样兼容：旧版本对端会忽略无法识别
+	// 的会话窗口控制帧，通信退化为单流窗口流控。
+	//
+	// 非零值不得小于初始单流窗口 initialStreamWindow（256KB）。
+	MaxSessionReceiveWindowSize uint32
+
 	// StreamOpenTimeout is the maximum amount of time that a stream will
 	// be allowed to remain in pending state while waiting for an ack from the peer.
 	// Once the timeout is reached the session will be gracefully closed.
@@ -85,6 +99,9 @@ func VerifyConfig(config *Config) error {
 	}
 	if config.MaxStreamWindowSize < initialStreamWindow {
 		return fmt.Errorf("MaxStreamWindowSize must be larger than %d", initialStreamWindow)
+	}
+	if config.MaxSessionReceiveWindowSize != 0 && config.MaxSessionReceiveWindowSize < initialStreamWindow {
+		return fmt.Errorf("MaxSessionReceiveWindowSize must be zero or at least %d", initialStreamWindow)
 	}
 	if config.LogOutput != nil && config.Logger != nil {
 		return fmt.Errorf("both Logger and LogOutput may not be set, select one")

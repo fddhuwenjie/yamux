@@ -129,6 +129,39 @@ larger window.
 Both sides should track the number of bytes sent in Data frames
 only, as only they are tracked as part of the window size.
 
+## 可选的会话级接收窗口（Session Receive Window，可选扩展）
+
+单流窗口只能约束单条流。当一条会话上复用大量流且接收端读取缓慢时，
+每条流的未读数据仍可各自累积到单流窗口上限。为把“整条会话的未读数据
+总量”约束在接收端额度内，实现提供了可选的会话级接收窗口扩展
+（对应配置 `Config.MaxSessionReceiveWindowSize`，取 0 表示不启用，
+保持本文件前述的原有行为）。
+
+该扩展完全复用既有帧格式，不引入新的消息类型：
+
+* 通告帧（能力协商 + 初始窗口）：接收端启用后，会把该帧作为会话发出的
+  第一帧。帧内容为 Type=`Window Update`、Flags=`ACK`、StreamID=`0`、
+  Length=`MaxSessionReceiveWindowSize`。发送端收到该帧后激活会话级
+  发送额度，初始额度为通告窗口减去激活前已经发出的数据字节数（这部分
+  在途字节以“额度债务”形式记账，会随接收端返还逐步弥补，不会永久丢失）。
+* 增量返还帧：Type=`Window Update`、Flags=`0`、StreamID=`0`、
+  Length=本次返还的字节数 delta。接收端在任意流的数据被应用读走，或
+  含未读数据的流被完全关闭（FIN 双向完成或 RST）时返还；额度曾经耗尽
+  时任意数量都立即返还，否则按半窗口批量返还。
+
+语义与约束：
+
+* 仅当接收端启用（发出通告）时，对应方向才存在会话级约束；未启用或
+  旧版本对端不发送通告，发送端始终按单流窗口工作。
+* 旧版本对端收到 StreamID=`0` 的 Window Update 时，会把它作为
+  “未知流的窗口更新”安全忽略，不会创建流、不会断连，因此支持灰度
+  开启与新旧端互通。
+* 会话额度耗尽时数据帧写入在发送端排队等待，但 Ping、Window Update、
+  GoAway 等控制帧不经过额度预留，不会被等待中的数据阻塞；已建立的流
+  不会仅因额度耗尽而被重置。
+* 大写入随额度返还分块完成，字节顺序与完整性不变；写入超时、流关闭或
+  会话关闭后不会产生迟到数据、永久占用的额度或永久卡住的写入。
+
 ## Session termination
 
 When a session is being terminated, the Go Away message should

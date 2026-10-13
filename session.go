@@ -80,6 +80,21 @@ type Session struct {
 	shutdownCh      chan struct{}
 	shutdownLock    sync.Mutex
 	shutdownErrLock sync.Mutex
+
+	// sessionRecv* 是本端作为接收端的全会话接收窗口记账，仅在本地配置
+	// MaxSessionReceiveWindowSize > 0 时启用。
+	sessionRecvMu      sync.Mutex
+	sessionRecvOn      bool
+	sessionRecvCredit  int64  // 当前剩余的全会话接收额度，允许因通告与在途数据竞速短暂为负
+	sessionRecvPending uint32 // 已读走/丢弃但尚未通过窗口更新帧返还的额度
+
+	// peerSession* 是对端通告的全会话接收窗口记账，收到对端通告后激活，
+	// 本端所有流的数据帧发送共享该额度。
+	peerSessionMu      sync.Mutex
+	peerSessionOn      bool
+	peerSessionCredit  int64  // 当前可用的对端会话额度，可能为负（激活前在途字节形成的债务）
+	peerSessionPreSent uint64 // 激活前已经成功发送的数据字节数
+	peerSessionNotify  chan struct{}
 }
 
 // sendReady is used to either mark a stream as ready
@@ -99,25 +114,28 @@ func newSession(config *Config, conn io.ReadWriteCloser, client bool) *Session {
 	}
 
 	s := &Session{
-		config:     config,
-		logger:     logger,
-		conn:       conn,
-		bufRead:    bufio.NewReader(conn),
-		pings:      make(map[uint32]chan struct{}),
-		streams:    make(map[uint32]*Stream),
-		inflight:   make(map[uint32]struct{}),
-		synCh:      make(chan struct{}, config.AcceptBacklog),
-		acceptCh:   make(chan *Stream, config.AcceptBacklog),
-		sendCh:     make(chan *sendReady, 64),
-		recvDoneCh: make(chan struct{}),
-		sendDoneCh: make(chan struct{}),
-		shutdownCh: make(chan struct{}),
+		config:            config,
+		logger:            logger,
+		conn:              conn,
+		bufRead:           bufio.NewReader(conn),
+		pings:             make(map[uint32]chan struct{}),
+		streams:           make(map[uint32]*Stream),
+		inflight:          make(map[uint32]struct{}),
+		synCh:             make(chan struct{}, config.AcceptBacklog),
+		acceptCh:          make(chan *Stream, config.AcceptBacklog),
+		sendCh:            make(chan *sendReady, 64),
+		recvDoneCh:        make(chan struct{}),
+		sendDoneCh:        make(chan struct{}),
+		shutdownCh:        make(chan struct{}),
+		peerSessionNotify: make(chan struct{}, 1),
 	}
 	if client {
 		s.nextStreamID = 1
 	} else {
 		s.nextStreamID = 2
 	}
+	// 在后台 goroutine 启动前排入会话窗口通告（启用时），保证其为第一帧。
+	s.initSessionReceiveWindow()
 	go s.recv()
 	go s.send()
 	if config.EnableKeepAlive {
@@ -581,6 +599,14 @@ func (s *Session) handleStreamMessage(hdr header) error {
 	// Check for a new stream creation
 	id := hdr.StreamID()
 	flags := hdr.Flags()
+
+	// Session scoped window control frames use the reserved session stream ID.
+	// This must be handled before the SYN/incomingStream path, and old peers
+	// simply ignore WindowUpdate frames addressed to an unknown stream 0.
+	if hdr.MsgType() == typeWindowUpdate && id == sessionControlStreamID {
+		return s.handleSessionWindowControl(hdr)
+	}
+
 	if flags&flagSYN == flagSYN {
 		if err := s.incomingStream(id); err != nil {
 			return err
@@ -601,6 +627,11 @@ func (s *Session) handleStreamMessage(hdr header) error {
 				s.logger.Printf("[ERR] yamux: Failed to discard data: %v", err)
 				return nil
 			}
+			// The discarded data never entered a receive buffer on this
+			// endpoint but the sender had charged it to the session window;
+			// return the credits at once so peers blocked on the exhausted
+			// session window can resume.
+			s.returnUnchargedSessionRecv(hdr.Length())
 		} else {
 			s.logger.Printf("[WARN] yamux: frame for missing stream: %v", hdr)
 		}
@@ -729,8 +760,28 @@ func (s *Session) closeStream(id uint32) {
 			s.logger.Printf("[ERR] yamux: SYN tracking out of sync")
 		}
 	}
+	stream := s.streams[id]
 	delete(s.streams, id)
 	s.streamLock.Unlock()
+
+	// A fully closed stream (both sides closed or reset) keeps its buffered
+	// data readable until drained, but no further data frames can reach it
+	// (the stream was removed from the map). The unread bytes were charged
+	// against this endpoint's session receive window and would otherwise be
+	// returned only when read, which may never happen; return them now and
+	// mark the stream so a later draining Read does not return them twice.
+	if stream != nil {
+		stream.recvLock.Lock()
+		var abandoned uint32
+		if stream.recvBuf != nil {
+			abandoned = uint32(stream.recvBuf.Len())
+		}
+		if abandoned > 0 {
+			stream.sessionCreditsReleased = true
+		}
+		stream.recvLock.Unlock()
+		s.releaseSessionRecv(abandoned)
+	}
 }
 
 // establishStream is used to mark a stream that was in the

@@ -129,6 +129,25 @@ const (
 )
 
 const (
+	// sessionControlStreamID is the reserved stream ID for session scoped
+	// control frames. It is already used by Ping and GoAway; session level
+	// window updates (an optional extension, see Config.MaxSessionReceiveWindowSize)
+	// reuse it with typeWindowUpdate:
+	//
+	//   - flags = ACK, Length = MaxSessionReceiveWindowSize:
+	//     one-time announcement sent as the first frame of a session, enabling
+	//     session level flow control at the receiving peer.
+	//   - flags = 0, Length = delta:
+	//     incremental session receive window credits returned by the receiver
+	//     (data read from any stream or unread data dropped on full close).
+	//
+	// Peers that do not understand the extension simply ignore WindowUpdate
+	// frames addressed to a missing stream (ID 0), which keeps wire
+	// compatibility with older versions.
+	sessionControlStreamID uint32 = 0
+)
+
+const (
 	// goAwayNormal is sent on a normal termination
 	goAwayNormal uint32 = iota
 

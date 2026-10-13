@@ -42,6 +42,12 @@ type Stream struct {
 	recvBuf  *bytes.Buffer
 	recvLock sync.Mutex
 
+	// sessionCreditsReleased is set while recvLock is held when a stream is
+	// fully closed: the unread bytes still in recvBuf were returned to the
+	// session receive window wholesale, so a later Read that drains them must
+	// not return the same session credits a second time.
+	sessionCreditsReleased bool
+
 	controlHdr     header
 	controlErr     chan error
 	controlHdrLock sync.Mutex
@@ -103,6 +109,10 @@ func (s *Stream) StreamID() uint32 {
 // them in order or along message boundaries, and may encounter deadlocks.
 func (s *Stream) Read(b []byte) (n int, err error) {
 	defer asyncNotify(s.recvNotifyCh)
+	// creditsReleased records whether the bytes read had their session
+	// credits returned already when the stream was fully closed; declared
+	// before the START label because goto must not jump over it.
+	var creditsReleased bool
 START:
 
 	// If the stream is closed and there's no data buffered, return EOF
@@ -135,7 +145,16 @@ START:
 
 	// Read any bytes
 	n, _ = s.recvBuf.Read(b)
+	creditsReleased = s.sessionCreditsReleased
 	s.recvLock.Unlock()
+
+	// Bytes consumed by the application can be returned as session wide
+	// receive window credits to peers blocked on the shared quota. If the
+	// stream was fully closed first, these bytes were already returned
+	// wholesale then and must not be credited twice.
+	if !creditsReleased {
+		s.session.noteSessionDataConsumed(uint32(n))
+	}
 
 	// Send a window update potentially
 	err = s.sendWindowUpdate()
@@ -190,6 +209,15 @@ func (s *Stream) write(b []byte) (n int, err error) {
 	var flags uint16
 	var max uint32
 	var body []byte
+	// sessionReserved records whether the current chunk had session level
+	// receive window credits reserved, so accounting can be finalized exactly
+	// once after the send completes or fails.
+	var sessionReserved bool
+	// peerSessionNotify holds the notification channel captured atomically
+	// together with an "exhausted" credit decision; waiting must use this
+	// exact channel to avoid missing a credit update between decision and
+	// wait. It is nil when waiting for the per-stream window only.
+	var peerSessionNotify <-chan struct{}
 START:
 	s.stateLock.Lock()
 	switch s.state {
@@ -207,6 +235,7 @@ START:
 	// If there is no data available, block
 	window := atomic.LoadUint32(&s.sendWindow)
 	if window == 0 {
+		peerSessionNotify = nil
 		goto WAIT
 	}
 
@@ -215,11 +244,23 @@ START:
 
 	// Send up to our send window
 	max = min(window, uint32(len(b)))
+
+	// Additionally constrain the chunk by the peer's session wide receive
+	// window when the peer enabled session level flow control. A zero grant
+	// means the session quota is exhausted (other streams may hold it); wait
+	// for credits without queuing any data or resetting this stream.
+	max, sessionReserved, peerSessionNotify = s.session.reservePeerSessionOrWait(max)
+	if max == 0 {
+		goto WAIT
+	}
 	body = b[:max]
 
 	// Send the header
 	s.sendHdr.encode(typeData, flags, s.id, max)
 	if err = s.session.waitForSendErr(s.sendHdr, body, s.sendErr); err != nil {
+		// Give reserved session credits back so no quota is leaked and other
+		// streams can proceed; no data of this chunk is accounted as sent.
+		s.session.refundPeerSession(max, sessionReserved)
 		if errors.Is(err, ErrSessionShutdown) || errors.Is(err, ErrConnectionWriteTimeout) {
 			// Message left in ready queue, header re-use is unsafe.
 			s.sendHdr = header(make([]byte, headerSize))
@@ -229,6 +270,10 @@ START:
 
 	// Reduce our send window
 	atomic.AddUint32(&s.sendWindow, ^uint32(max-1))
+
+	// Finalize session window accounting (pre-activation bytes are tracked
+	// separately so activation can compute the exact initial quota).
+	s.session.commitPeerSessionSent(max, sessionReserved)
 
 	// Unlock
 	return int(max), err
@@ -242,9 +287,17 @@ WAIT:
 		timer = time.NewTimer(delay)
 		timeout = timer.C
 	}
+	// When waiting on the per-stream window only, snapshot the session
+	// notification channel here; when session credits were the blocker,
+	// peerSessionNotify was captured atomically with the exhaustion decision
+	// so no in-between credit update can be missed.
+	if peerSessionNotify == nil {
+		_, _, peerSessionNotify = s.session.peerSessionSnapshot()
+	}
 	select {
 	case <-s.session.shutdownCh:
 	case <-s.sendNotifyCh:
+	case <-peerSessionNotify:
 	case <-timeout:
 		return 0, ErrTimeout
 	}
@@ -253,6 +306,8 @@ WAIT:
 			<-timeout
 		}
 	}
+	sessionReserved = false
+	peerSessionNotify = nil
 	goto START
 }
 
@@ -415,23 +470,17 @@ func (s *Stream) forceClose() {
 }
 
 // processFlags is used to update the state of the stream
-// based on set flags, if any. Lock must be held
+// based on set flags, if any.
 func (s *Stream) processFlags(flags uint16) error {
 	s.stateLock.Lock()
-	defer s.stateLock.Unlock()
 
-	// Close the stream without holding the state lock
+	// closeStream is set when the stream must be removed from the session
+	// after the state transition. The actual close (which may take the
+	// receive lock to release session credits) must run only AFTER
+	// stateLock is released: Read takes recvLock before stateLock in
+	// sendWindowUpdate, so nesting stateLock inside recvLock the other way
+	// around would deadlock a reader against a FIN/RST being processed.
 	closeStream := false
-	defer func() {
-		if closeStream {
-			if s.closeTimer != nil {
-				// Stop our close timeout timer since we gracefully closed
-				s.closeTimer.Stop()
-			}
-
-			s.session.closeStream(s.id)
-		}
-	}()
 
 	if flags&flagACK == flagACK {
 		if s.state == streamSYNSent {
@@ -455,6 +504,7 @@ func (s *Stream) processFlags(flags uint16) error {
 			s.notifyWaiting()
 		default:
 			s.session.logger.Printf("[ERR] yamux: unexpected FIN flag in state %d", s.state)
+			s.stateLock.Unlock()
 			return ErrUnexpectedFlag
 		}
 	}
@@ -462,6 +512,16 @@ func (s *Stream) processFlags(flags uint16) error {
 		s.state = streamReset
 		closeStream = true
 		s.notifyWaiting()
+	}
+	s.stateLock.Unlock()
+
+	if closeStream {
+		if s.closeTimer != nil {
+			// Stop our close timeout timer since we gracefully closed
+			s.closeTimer.Stop()
+		}
+
+		s.session.closeStream(s.id)
 	}
 	return nil
 }
@@ -503,6 +563,23 @@ func (s *Stream) readData(hdr header, flags uint16, conn io.Reader) error {
 	// Copy into buffer
 	s.recvLock.Lock()
 
+	// A fully closed stream may already have had its buffered bytes returned
+	// wholesale to the session receive window (e.g. closeTimeout racing with
+	// a data frame already dispatched to this stream). Such late data must
+	// not re-enter the buffer: discard it from the wire and give its session
+	// credits back, so they are neither leaked nor credited twice. The bytes
+	// never entered a buffer, so local receive accounting is untouched.
+	if s.sessionCreditsReleased {
+		s.recvLock.Unlock()
+		if _, err := io.Copy(io.Discard, conn); err != nil {
+			s.session.logger.Printf("[ERR] yamux: Failed to discard stream data: %v", err)
+			return err
+		}
+		s.session.returnUnchargedSessionRecv(length)
+		asyncNotify(s.recvNotifyCh)
+		return nil
+	}
+
 	if length > s.recvWindow {
 		s.session.logger.Printf("[ERR] yamux: receive window exceeded (stream: %d, remain: %d, recv: %d)", s.id, s.recvWindow, length)
 		s.recvLock.Unlock()
@@ -524,6 +601,10 @@ func (s *Stream) readData(hdr header, flags uint16, conn io.Reader) error {
 	// Decrement the receive window
 	s.recvWindow -= uint32(copiedLength)
 	s.recvLock.Unlock()
+
+	// Charge the buffered bytes against the session wide receive window so
+	// unread data across all streams shares the one receiver quota.
+	s.session.noteSessionDataBuffered(uint32(copiedLength))
 
 	// Unblock any readers
 	asyncNotify(s.recvNotifyCh)
