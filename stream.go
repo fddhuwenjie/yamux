@@ -62,6 +62,11 @@ type Stream struct {
 	// closeTimer is set with stateLock held to honor the StreamCloseTimeout
 	// setting on Session.
 	closeTimer *time.Timer
+
+	// priority 是该流的发送等级（0 到 7），仅在会话开启
+	// EnablePriorityScheduling 时参与发送调度。零值 0 即默认等级，
+	// 通过原子操作读写，可在数据等待发送期间随时调整。
+	priority atomic.Int32
 }
 
 // newStream is used to construct a new stream within
@@ -94,6 +99,24 @@ func (s *Stream) Session() *Session {
 // StreamID returns the ID of this stream
 func (s *Stream) StreamID() uint32 {
 	return s.id
+}
+
+// SetPriority 设置流的发送等级，取值范围为 0 到 7，数值越大越优先发送。
+// 等级可以随时调整（包括该流已有数据帧排队等待发送时）：已排队但尚未
+// 发送的数据会在下次调度时采用最新等级。传入非法等级时返回
+// ErrInvalidPriority，且保持原有等级不变。该设置仅在会话开启
+// Config.EnablePriorityScheduling 时影响发送顺序，未开启时仅记录等级。
+func (s *Stream) SetPriority(priority int) error {
+	if priority < priorityMin || priority > priorityMax {
+		return ErrInvalidPriority
+	}
+	s.priority.Store(int32(priority))
+	return nil
+}
+
+// Priority 返回流当前的发送等级（0 到 7），新流的默认等级为 0。
+func (s *Stream) Priority() int {
+	return int(s.priority.Load())
 }
 
 // Read is used to read from the stream. It is safe to call Write, Read, and/or
@@ -219,7 +242,7 @@ START:
 
 	// Send the header
 	s.sendHdr.encode(typeData, flags, s.id, max)
-	if err = s.session.waitForSendErr(s.sendHdr, body, s.sendErr); err != nil {
+	if err = s.session.waitForSendErr(s.sendHdr, body, s.sendErr, s); err != nil {
 		if errors.Is(err, ErrSessionShutdown) || errors.Is(err, ErrConnectionWriteTimeout) {
 			// Message left in ready queue, header re-use is unsafe.
 			s.sendHdr = header(make([]byte, headerSize))
@@ -303,7 +326,7 @@ func (s *Stream) sendWindowUpdate() error {
 
 	// Send the header
 	s.controlHdr.encode(typeWindowUpdate, flags, s.id, delta)
-	if err := s.session.waitForSendErr(s.controlHdr, nil, s.controlErr); err != nil {
+	if err := s.session.waitForSendErr(s.controlHdr, nil, s.controlErr, s); err != nil {
 		if errors.Is(err, ErrSessionShutdown) || errors.Is(err, ErrConnectionWriteTimeout) {
 			// Message left in ready queue, header re-use is unsafe.
 			s.controlHdr = header(make([]byte, headerSize))
@@ -321,7 +344,7 @@ func (s *Stream) sendClose() error {
 	flags := s.sendFlags()
 	flags |= flagFIN
 	s.controlHdr.encode(typeWindowUpdate, flags, s.id, 0)
-	if err := s.session.waitForSendErr(s.controlHdr, nil, s.controlErr); err != nil {
+	if err := s.session.waitForSendErr(s.controlHdr, nil, s.controlErr, s); err != nil {
 		if errors.Is(err, ErrSessionShutdown) || errors.Is(err, ErrConnectionWriteTimeout) {
 			// Message left in ready queue, header re-use is unsafe.
 			s.controlHdr = header(make([]byte, headerSize))

@@ -69,6 +69,10 @@ type Session struct {
 	// or to send a header out directly.
 	sendCh chan *sendReady
 
+	// scheduler 在 Config.EnablePriorityScheduling 开启时替代 sendCh，
+	// 按流优先级调度待发送帧；为 nil 时保持既有的 FIFO 行为。
+	scheduler *sendScheduler
+
 	// recvDoneCh is closed when recv() exits to avoid a race
 	// between stream registration and stream shutdown
 	recvDoneCh chan struct{}
@@ -89,6 +93,16 @@ type sendReady struct {
 	mu   sync.Mutex // Protects Body from unsafe reads.
 	Body []byte
 	Err  chan error
+
+	// stream 标识帧所属的流：非 nil 时按该流的最新优先级调度，
+	// nil 表示会话级控制帧（Ping、GoAway 等），始终以最高等级发送。
+	stream *Stream
+
+	// seq 是入队时分配的单调递增就绪序号，用于同等级 FIFO。
+	seq uint64
+
+	// queuedAt 记录入队时刻已发送帧计数，用于等待老化防饥饿。
+	queuedAt uint64
 }
 
 // newSession is used to construct a new session
@@ -108,10 +122,13 @@ func newSession(config *Config, conn io.ReadWriteCloser, client bool) *Session {
 		inflight:   make(map[uint32]struct{}),
 		synCh:      make(chan struct{}, config.AcceptBacklog),
 		acceptCh:   make(chan *Stream, config.AcceptBacklog),
-		sendCh:     make(chan *sendReady, 64),
+		sendCh:     make(chan *sendReady, sendQueueCapacity),
 		recvDoneCh: make(chan struct{}),
 		sendDoneCh: make(chan struct{}),
 		shutdownCh: make(chan struct{}),
+	}
+	if config.EnablePriorityScheduling {
+		s.scheduler = newSendScheduler(sendQueueCapacity)
 	}
 	if client {
 		s.nextStreamID = 1
@@ -288,6 +305,12 @@ func (s *Session) Close() error {
 
 	close(s.shutdownCh)
 
+	// 唤醒优先级调度器中可能因队列满而阻塞的发送方，以及在空队列上
+	// 等待的发送协程，使它们立刻走关闭路径而不是卡住。
+	if s.scheduler != nil {
+		s.scheduler.shutdown()
+	}
+
 	_ = s.conn.Close()
 	<-s.recvDoneCh
 
@@ -384,13 +407,31 @@ func (s *Session) keepalive() {
 // waitForSendErr waits to send a header, checking for a potential shutdown
 func (s *Session) waitForSend(hdr header, body []byte) error {
 	errCh := make(chan error, 1)
-	return s.waitForSendErr(hdr, body, errCh)
+	return s.waitForSendErr(hdr, body, errCh, nil)
+}
+
+// enqueueReady 把一帧交给发送协程。未开启优先级模式时进入 FIFO 的
+// sendCh；开启时进入优先级调度器。入队受连接写超时与会话关闭约束。
+func (s *Session) enqueueReady(ready *sendReady, timer *time.Timer) error {
+	if q := s.scheduler; q != nil {
+		return q.put(ready, timer.C, s.shutdownCh)
+	}
+	select {
+	case s.sendCh <- ready:
+		return nil
+	case <-s.shutdownCh:
+		return ErrSessionShutdown
+	case <-timer.C:
+		return ErrConnectionWriteTimeout
+	}
 }
 
 // waitForSendErr waits to send a header with optional data, checking for a
 // potential shutdown. Since there's the expectation that sends can happen
-// in a timely manner, we enforce the connection write timeout here.
-func (s *Session) waitForSendErr(hdr header, body []byte, errCh chan error) error {
+// in a timely manner, we enforce the connection write timeout here. The
+// stream argument associates the frame with its stream for priority
+// scheduling; session-level control frames pass nil.
+func (s *Session) waitForSendErr(hdr header, body []byte, errCh chan error, stream *Stream) error {
 	t := timerPool.Get()
 	timer := t.(*time.Timer)
 	timer.Reset(s.config.ConnectionWriteTimeout)
@@ -403,13 +444,9 @@ func (s *Session) waitForSendErr(hdr header, body []byte, errCh chan error) erro
 		timerPool.Put(t)
 	}()
 
-	ready := &sendReady{Hdr: hdr, Body: body, Err: errCh}
-	select {
-	case s.sendCh <- ready:
-	case <-s.shutdownCh:
-		return ErrSessionShutdown
-	case <-timer.C:
-		return ErrConnectionWriteTimeout
+	ready := &sendReady{Hdr: hdr, Body: body, Err: errCh, stream: stream}
+	if err := s.enqueueReady(ready, timer); err != nil {
+		return err
 	}
 
 	bodyCopy := func() {
@@ -460,14 +497,7 @@ func (s *Session) sendNoWait(hdr header) error {
 		timerPool.Put(t)
 	}()
 
-	select {
-	case s.sendCh <- &sendReady{Hdr: hdr}:
-		return nil
-	case <-s.shutdownCh:
-		return ErrSessionShutdown
-	case <-timer.C:
-		return ErrConnectionWriteTimeout
-	}
+	return s.enqueueReady(&sendReady{Hdr: hdr}, timer)
 }
 
 // send is a long running goroutine that sends data
@@ -483,50 +513,67 @@ func (s *Session) sendLoop() error {
 	for {
 		bodyBuf.Reset()
 
-		select {
-		case ready := <-s.sendCh:
-			// Send a header if ready
-			if ready.Hdr != nil {
-				_, err := s.conn.Write(ready.Hdr)
-				if err != nil {
-					s.logger.Printf("[ERR] yamux: Failed to write header: %v", err)
-					asyncSendErr(ready.Err, err)
-					return err
-				}
+		var ready *sendReady
+		if q := s.scheduler; q != nil {
+			// 优先级模式：由调度器选帧。正在写出的帧不会被打断，
+			// 每次写完后在此重新选取，新入队的高等级帧即刻参与竞争。
+			ready = q.pop()
+			if ready == nil {
+				return nil
 			}
-
-			ready.mu.Lock()
-			if ready.Body != nil {
-				// Copy the body into the buffer to avoid
-				// holding a mutex lock during the write.
-				_, err := bodyBuf.Write(ready.Body)
-				if err != nil {
-					ready.Body = nil
-					ready.mu.Unlock()
-					s.logger.Printf("[ERR] yamux: Failed to copy body into buffer: %v", err)
-					asyncSendErr(ready.Err, err)
-					return err
-				}
-				ready.Body = nil
+		} else {
+			select {
+			case ready = <-s.sendCh:
+			case <-s.shutdownCh:
+				return nil
 			}
-			ready.mu.Unlock()
+		}
 
-			if bodyBuf.Len() > 0 {
-				// Send data from a body if given
-				_, err := s.conn.Write(bodyBuf.Bytes())
-				if err != nil {
-					s.logger.Printf("[ERR] yamux: Failed to write body: %v", err)
-					asyncSendErr(ready.Err, err)
-					return err
-				}
-			}
-
-			// No error, successful send
-			asyncSendErr(ready.Err, nil)
-		case <-s.shutdownCh:
-			return nil
+		if err := s.writeReady(ready, &bodyBuf); err != nil {
+			return err
 		}
 	}
+}
+
+// writeReady 将一帧（可选消息体）完整写到底层连接，并通过 ready.Err
+// 通知发送方结果。调用串行发生在唯一的 sendLoop 协程中。
+func (s *Session) writeReady(ready *sendReady, bodyBuf *bytes.Buffer) error {
+	// Send a header if ready
+	if ready.Hdr != nil {
+		if _, err := s.conn.Write(ready.Hdr); err != nil {
+			s.logger.Printf("[ERR] yamux: Failed to write header: %v", err)
+			asyncSendErr(ready.Err, err)
+			return err
+		}
+	}
+
+	ready.mu.Lock()
+	if ready.Body != nil {
+		// Copy the body into the buffer to avoid
+		// holding a mutex lock during the write.
+		if _, err := bodyBuf.Write(ready.Body); err != nil {
+			ready.Body = nil
+			ready.mu.Unlock()
+			s.logger.Printf("[ERR] yamux: Failed to copy body into buffer: %v", err)
+			asyncSendErr(ready.Err, err)
+			return err
+		}
+		ready.Body = nil
+	}
+	ready.mu.Unlock()
+
+	if bodyBuf.Len() > 0 {
+		// Send data from a body if given
+		if _, err := s.conn.Write(bodyBuf.Bytes()); err != nil {
+			s.logger.Printf("[ERR] yamux: Failed to write body: %v", err)
+			asyncSendErr(ready.Err, err)
+			return err
+		}
+	}
+
+	// No error, successful send
+	asyncSendErr(ready.Err, nil)
+	return nil
 }
 
 // recv is a long running goroutine that accepts new data

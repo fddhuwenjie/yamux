@@ -54,6 +54,24 @@ type Config struct {
 	// Logger is used to pass in the logger to be used. Either Logger or
 	// LogOutput can be set, not both.
 	Logger Logger
+
+	// EnablePriorityScheduling 用于开启可选的发送优先级调度模式，默认关闭。
+	//
+	// 关闭时（默认），所有待发送帧严格按进入发送队列的先后顺序写出，保持
+	// 既有行为不变。
+	//
+	// 开启后：
+	//   - 每条流的发送等级默认为 0，可通过 Stream.SetPriority 在 0 到 7 之间
+	//     随时调整，已排队但尚未发送的数据帧在调度时采用最新等级；
+	//   - 当前正在写出的帧不会被打断，写完之后优先处理等待中的高等级流，
+	//     同等级按就绪先后（FIFO）发送；
+	//   - Ping、窗口更新、RST、GoAway 等控制消息始终高于普通数据帧，避免被
+	//     持续的大数据流量阻塞；
+	//   - 持续繁忙的高等级流不会长期独占发送机会：等待过久的低等级帧会被
+	//     逐级提升等级，保证仍有发送窗口的低等级流持续前进；
+	//   - 每条流的字节内容、顺序与流控语义保持不变，写超时、流关闭与会话
+	//     关闭都不会使其他流卡死。
+	EnablePriorityScheduling bool
 }
 
 func (c *Config) Clone() *Config {

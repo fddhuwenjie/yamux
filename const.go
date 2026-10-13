@@ -79,6 +79,9 @@ var (
 
 	// ErrKeepAliveTimeout is sent if a missed keepalive caused the stream close
 	ErrKeepAliveTimeout = fmt.Errorf("keepalive timeout")
+
+	// ErrInvalidPriority 表示通过 Stream.SetPriority 设置了 0 到 7 之外的等级
+	ErrInvalidPriority = fmt.Errorf("invalid stream priority: must be between 0 and 7")
 )
 
 const (
